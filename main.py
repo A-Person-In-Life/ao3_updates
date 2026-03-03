@@ -1,52 +1,63 @@
-import requests
-from bs4 import BeautifulSoup
 import time
 import sqlite3
-import sys
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+from bads3wrapper.s3_api import S3Api
 
-sys.path.append("s3_api")
-from s3api import S3Api
+HEADERS = {}
+HEADERS["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Firefox/135.0"
 
-class work:
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+class Work:
     def __init__(self, url, cursor, connection):
         self.connection = connection
         self.cursor = cursor
-        self.headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0"}
         self.work_url = url
         self.work_id = ""
         self.base_url = "https://archiveofourown.org/works/"
-        self.download_type = ".pdf"
         self.chapter_count = None
         self.updated = False
         self.title = ""
-
         self.get_work_id()
         if not self.set_from_database():
+            start_time = time.time()
             print("Work not found in database. Fetching metadata and downloading work.")
             self.get_metadata()
+            self.download_work()
             self.database_update()
+            end_time = time.time()
+            print("Took " + str(end_time - start_time) + " seconds to fetch metadata and download work with ID " + self.work_id + ".")
 
     def get_work_id(self):
-        self.work_id = self.work_url[len(self.base_url):]
-        return
+        path = urlparse(self.work_url).path 
+        self.work_id = path.strip("/").split("/")[-1]
     
     def download_work(self):
-        download_url = self.base_url + self.work_id + "/download" + self.download_type
-        response = requests.get(download_url)
+        download_url = self.base_url + self.work_id + "/download?format=epub&view_adult=true"        
+        response = SESSION.get(download_url)
 
         if response.status_code != 200:
             print(f"Failed to download work with ID: {self.work_id}. Status code: {response.status_code}")
-            return
-        
-        else:
-            print(f"Successfully downloaded work with ID: {self.work_id}. Status code: {response.status_code}")
-            filename = f"{self.work_id}_{self.title}.pdf"
-            with open(f"pdfs/{filename}", "wb") as f:
-                f.write(response.content)
+            return False
+
+        if "application/epub+zip" not in response.headers.get("Content-Type", ""):
+            print("Download did not return an epub")
+            return False
+
+        filename = self.work_id + "_" + self.title + ".epub"
+        with open("pdfs/" + filename, "wb") as file:
+            file.write(response.content)
+            file.close()
+
+        print("Successfully downloaded EPUB for work " + self.work_id)
+        return True
     
     def get_metadata(self):
-        metadata_url = self.base_url + self.work_id
-        response = requests.get(metadata_url)
+        metadata_url = self.base_url + self.work_id + "?view_adult=true"
+        response = SESSION.get(metadata_url)
         if response.status_code != 200:
             print(f"Failed to fetch metadata for work with ID: {self.work_id}. Status code: {response.status_code}")
             return
@@ -54,9 +65,16 @@ class work:
         else:
             print(f"Successfully fetched metadata for work with ID: {self.work_id}. Status code: {response.status_code}")
             soup = BeautifulSoup(response.content, "html.parser")
-            current_chapter_count = soup.find("dd", class_="chapters").text.strip()
-            title = soup.find("h2", class_="title").text.strip()
-            title = title.replace("/", "-").replace(":", "-")
+
+            title_tag = soup.find("h2", class_="title")
+            chapters_tag = soup.find("dd", class_="chapters")
+
+            if not title_tag or not chapters_tag:
+                print("Metadata page missing expected fields")
+                return
+
+            title = title_tag.text.strip().replace("/", "-").replace(":", "-")
+            current_chapter_count = chapters_tag.text.strip()
 
             if self.chapter_count is None:
                 self.chapter_count = current_chapter_count
@@ -87,7 +105,7 @@ class work:
 class ao3_monitor:
     def __init__(self, work_urls):
         self.works = work_urls
-        self.s3_api = S3Api("s3_api/config/aws_auth.txt")
+        self.s3_api = S3Api("config/aws_auth.txt")
     
     def monitor_loop(self):
         running = True
@@ -101,24 +119,28 @@ class ao3_monitor:
                     work.download_work()
                     work.updated = False
                     work.database_update()
-                    self.s3_api.deleteFile(f"fanfic/{work.work_id}_{work.title}.pdf")
-                    self.s3_api.uploadFile(f"pdfs/{work.work_id}_{work.title}.pdf", f"fanfic/{work.work_id}_{work.title}.pdf")
+                    try:
+                        self.s3_api.deleteItem("fanfic/" + work.work_id + "_" + work.title + ".epub")
+                    except Exception:
+                        pass                    
+                    self.s3_api.uploadFile(f"pdfs/{work.work_id}_{work.title}.epub", f"fanfic/{work.work_id}_{work.title}.epub")
 
                 else:
                     print(f"Work with ID: {work.work_id} has not been updated.")
 
-            time.sleep(10)
+            time.sleep(3600)
         
 if __name__ == "__main__":
 
 
     connection = sqlite3.connect("resources/works.db")
     cursor = connection.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS works (work_id STRING PRIMARY KEY, chapter_count STRING NOT NULL, updated BOOLEAN NOT NULL, title STRING NOT NULL)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS works (work_id STRING PRIMARY KEY, chapter_count STRING, updated BOOLEAN, title STRING)")
     connection.commit()
 
     work_urls = [
-        work("https://archiveofourown.org/works/55658536", cursor, connection)
+        Work("https://archiveofourown.org/works/55658536", cursor, connection),
+        Work("https://archiveofourown.org/works/44789995", cursor, connection)
     ]
 
     monitor = ao3_monitor(work_urls)
