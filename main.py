@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
 import AO3
+import smtplib
+import email
 from bads3wrapper.s3_api import S3Api
 
 
@@ -88,6 +90,11 @@ class AO3Monitor:
 
                 await asyncio.sleep(3600)
 
+    def send_email_notification(self, work):
+        with open("config/email_auth.txt") as f:
+            email_address = f.readline().strip()
+            password = f.read().strip()
+
 
 if __name__ == "__main__":
     connection = sqlite3.connect("resources/works.db")
@@ -101,6 +108,7 @@ if __name__ == "__main__":
     work_ids = [
         55658536,
         44789995,
+        28310742
     ]
 
     works = [Work(work_id, cursor, connection) for work_id in work_ids]
