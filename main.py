@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 import AO3
-import smtplib
+import aiosmtplib
 import email
 from bads3wrapper.s3_api import S3Api
 
@@ -25,26 +25,32 @@ class Work:
 
     async def download_work(self, s3_api):
         if self.work is None:
-            self.work = AO3.Work(self.work_id)
-        with open(f"pdfs/{self.title}.pdf", "wb") as f:
-            f.write(self.work.download("PDF"))
+            self.work = await asyncio.to_thread(AO3.Work, self.work_id)
+
+        pdf_data = await asyncio.to_thread(self.work.download, "PDF")
+        filepath = f"pdfs/{self.title}.pdf"
+        await asyncio.to_thread(self._write_pdf, filepath, pdf_data)
+
         print(f"Downloaded: {self.title} ({self.work_id})")
         s3_path = f"fanfic/{self.work_id}_{self.title}.pdf"
         try:
             await s3_api.deleteItem(s3_path)
         except Exception:
             pass
-        await s3_api.uploadFile(f"pdfs/{self.title}.pdf", s3_path)
+        await s3_api.uploadFile(filepath, s3_path)
 
-    def check_for_update(self):
+    def _write_pdf(self, filepath, data):
+        with open(filepath, "wb") as f:
+            f.write(data)
+
+    async def check_for_update(self):
         if self.work is None:
-            self.work = AO3.Work(self.work_id)
-        self.work.reload()
+            self.work = await asyncio.to_thread(AO3.Work, self.work_id)
+        await asyncio.to_thread(self.work.reload)
         new_chapter_count = len(self.work.chapters)
         if new_chapter_count != self.chapter_count:
             self.chapter_count = new_chapter_count
             self.updated = True
-            self.database_update()
 
     def database_update(self):
         self.cursor.execute(
@@ -69,31 +75,50 @@ class AO3Monitor:
     def __init__(self, works):
         self.works = works
 
+        with open("config/email_auth.txt") as f:
+            self.email_address = f.readline().strip()
+            self.password = f.read().strip()
+        
+
     async def monitor_loop(self):
         async with S3Api("config/aws_auth.txt") as s3_api:
             for work in self.works:
                 if work.is_new:
-                    await work.download_work(s3_api)
-                    work.database_update()
+                    try:
+                        await work.download_work(s3_api)
+                        await self.send_email_notification(work)
+                    except Exception as e:
+                        print(f"Failed to download new work {work.title}: {e}")
+                    finally:
+                        work.database_update()
 
             while True:
                 for work in self.works:
-                    work.check_for_update()
+                    await work.check_for_update()
 
                     if work.updated:
                         print(f"Update found: {work.title}. Downloading.")
                         await work.download_work(s3_api)
                         work.updated = False
                         work.database_update()
+                        await self.send_email_notification(work)
                     else:
                         print(f"No update: {work.title}")
 
                 await asyncio.sleep(3600)
 
-    def send_email_notification(self, work):
-        with open("config/email_auth.txt") as f:
-            email_address = f.readline().strip()
-            password = f.read().strip()
+    async def send_email_notification(self, work):
+        print(f"Sending email notification for {work.title}.")
+
+
+        message = email.message.EmailMessage()
+        message["From"] = self.email_address
+        message["To"] = self.email_address
+        message["Subject"] = f"Update for {work.title}"
+        message.set_content(f"{work.title} has been updated and uploaded to S3.")
+
+        await aiosmtplib.send(message, hostname="smtp.gmail.com", port=465, username=self.email_address, password=self.password, use_tls=True)
+        print(f"Email notification sent for {work.title}.")
 
 
 if __name__ == "__main__":
@@ -101,7 +126,7 @@ if __name__ == "__main__":
     cursor = connection.cursor()
     cursor.execute(
         "CREATE TABLE IF NOT EXISTS works "
-        "(work_id STRING PRIMARY KEY, chapter_count STRING, updated BOOLEAN, title STRING)"
+        "(work_id STRING PRIMARY KEY, chapter_count INTEGER, updated BOOLEAN, title STRING)"
     )
     connection.commit()
 
