@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import AO3
 import aiosmtplib
+import aiofiles
 import email
 from bads3wrapper.s3_api import S3Api
 
@@ -24,24 +25,21 @@ class Work:
             self.is_new = False
 
     async def download_work(self, s3_api):
+        path = f"pdfs/{self.title}.pdf"
+
         if self.work is None:
             self.work = await asyncio.to_thread(AO3.Work, self.work_id)
 
-        pdf_data = await asyncio.to_thread(self.work.download, "PDF")
-        filepath = f"pdfs/{self.title}.pdf"
-        await asyncio.to_thread(self._write_pdf, filepath, pdf_data)
+        with aiofiles.open(path, "wb") as f:
+            f.write(await asyncio.to_thread(self.work.download, "PDF"))
 
         print(f"Downloaded: {self.title} ({self.work_id})")
-        s3_path = f"fanfic/{self.work_id}_{self.title}.pdf"
+        s3_path = f"fanfic/{path.split('/')[1]}"
         try:
             await s3_api.deleteItem(s3_path)
         except Exception:
             pass
-        await s3_api.uploadFile(filepath, s3_path)
-
-    def _write_pdf(self, filepath, data):
-        with open(filepath, "wb") as f:
-            f.write(data)
+        await s3_api.uploadFile(path, s3_path)
 
     async def check_for_update(self):
         if self.work is None:
@@ -52,7 +50,7 @@ class Work:
             self.chapter_count = new_chapter_count
             self.updated = True
 
-    def database_update(self):
+    async def database_update(self):
         self.cursor.execute(
             "INSERT OR REPLACE INTO works (work_id, chapter_count, updated, title) VALUES (?, ?, ?, ?)",
             (self.work_id, self.chapter_count, self.updated, self.title),
@@ -133,7 +131,8 @@ if __name__ == "__main__":
     work_ids = [
         55658536,
         44789995,
-        28310742
+        28310742,
+        28310742,
     ]
 
     works = [Work(work_id, cursor, connection) for work_id in work_ids]
