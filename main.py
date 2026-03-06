@@ -18,7 +18,7 @@ class Work:
             self.work = AO3.Work(work_id)
             self.title = self.work.title.replace("/", "-").replace(":", "-")
             self.chapter_count = len(self.work.chapters)
-            self.updated = False
+            self.updated = True
             self.is_new = True
             print(f"New work found: {self.title}.")
         else:
@@ -30,8 +30,8 @@ class Work:
         if self.work is None:
             self.work = await asyncio.to_thread(AO3.Work, self.work_id)
 
-        with aiofiles.open(path, "wb") as f:
-            f.write(await asyncio.to_thread(self.work.download, "PDF"))
+        async with aiofiles.open(path, "wb") as f:
+            await f.write(await asyncio.to_thread(self.work.download, "PDF"))
 
         print(f"Downloaded: {self.title} ({self.work_id})")
         s3_path = f"fanfic/{path.split('/')[1]}"
@@ -50,7 +50,7 @@ class Work:
             self.chapter_count = new_chapter_count
             self.updated = True
 
-    async def database_update(self):
+    def database_update(self):
         self.cursor.execute(
             "INSERT OR REPLACE INTO works (work_id, chapter_count, updated, title) VALUES (?, ?, ?, ?)",
             (self.work_id, self.chapter_count, self.updated, self.title),
@@ -76,38 +76,37 @@ class AO3Monitor:
         with open("config/email_auth.txt") as f:
             self.email_address = f.readline().strip()
             self.password = f.read().strip()
-        
 
     async def monitor_loop(self):
-        async with S3Api("config/aws_auth.txt") as s3_api:
-            for work in self.works:
-                if work.is_new:
-                    try:
-                        await work.download_work(s3_api)
-                        await self.send_email_notification(work)
-                    except Exception as e:
-                        print(f"Failed to download new work {work.title}: {e}")
-                    finally:
-                        work.database_update()
+        async with S3Api("config/aws_auth.txt") as self.s3_api:
+            await asyncio.gather(*[self.process_work(work) for work in self.works])
 
             while True:
-                for work in self.works:
-                    await work.check_for_update()
-
-                    if work.updated:
-                        print(f"Update found: {work.title}. Downloading.")
-                        await work.download_work(s3_api)
-                        work.updated = False
-                        work.database_update()
-                        await self.send_email_notification(work)
-                    else:
-                        print(f"No update: {work.title}")
-
+                await asyncio.gather(*[self.process_work(work) for work in self.works])
                 await asyncio.sleep(3600)
+
+    async def process_work(self, work):
+        try:
+            if work.is_new:
+                await work.download_work(self.s3_api)
+                await self.send_email_notification(work)
+            else:
+                await work.check_for_update()
+                if work.updated:
+                    print(f"Update found: {work.title}. Downloading.")
+                    await work.download_work(self.s3_api)
+                    await self.send_email_notification(work)
+                else:
+                    print(f"No update: {work.title}")
+        except Exception as e:
+            print(f"Error processing {work.title}: {e}")
+
+        work.updated = False
+        work.is_new = False
+        work.database_update()
 
     async def send_email_notification(self, work):
         print(f"Sending email notification for {work.title}.")
-
 
         message = email.message.EmailMessage()
         message["From"] = self.email_address
@@ -131,7 +130,6 @@ if __name__ == "__main__":
     work_ids = [
         55658536,
         44789995,
-        28310742,
         28310742,
     ]
 
